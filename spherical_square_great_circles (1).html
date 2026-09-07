@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Spherical Square — Four Great Circles</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: transparent;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    #app {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      min-height: 420px;
+      background: #fff;
+      overflow: hidden;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: grab;
+      touch-action: none;
+      user-select: none;
+    }
+    canvas.dragging { cursor: grabbing; }
+    #hint, #reset {
+      position: absolute;
+      z-index: 2;
+      border: 1px solid rgba(0,0,0,.12);
+      border-radius: 9px;
+      background: rgba(255,255,255,.86);
+      color: #333;
+      backdrop-filter: blur(5px);
+      -webkit-backdrop-filter: blur(5px);
+    }
+    #hint {
+      left: 12px;
+      bottom: 10px;
+      padding: 6px 9px;
+      font-size: 12px;
+      line-height: 1.25;
+      pointer-events: none;
+    }
+    #reset {
+      top: 10px;
+      right: 10px;
+      padding: 7px 10px;
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    #reset:hover { background: rgba(245,245,245,.95); }
+    #reset:focus-visible { outline: 2px solid #444; outline-offset: 2px; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <button id="reset" type="button">Reset view</button>
+    <div id="hint">Drag to rotate • Scroll or pinch to zoom</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js';
+
+    const app = document.getElementById('app');
+    const resetButton = document.getElementById('reset');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xffffff);
+
+    const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 100);
+    camera.position.set(0, 0, 4.25);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    app.prepend(renderer.domElement);
+
+    // All sphere geometry goes in this group, so dragging rotates everything together.
+    const globe = new THREE.Group();
+    scene.add(globe);
+
+    const R = 1.45;
+
+    // Sphere surface.
+    const sphere = new THREE.Mesh(
+      new THREE.SphereGeometry(R, 96, 64),
+      new THREE.MeshPhongMaterial({
+        color: 0xfafafa,
+        specular: 0x888888,
+        shininess: 24,
+        transparent: true,
+        opacity: 0.92,
+        depthWrite: true
+      })
+    );
+    globe.add(sphere);
+
+    // Camera-facing outline. Since the sphere itself rotates but the camera does not orbit,
+    // the silhouette remains a circle, matching the black boundary in your sketch.
+    const outlinePoints = [];
+    for (let i = 0; i <= 360; i++) {
+      const t = i * Math.PI / 180;
+      outlinePoints.push(new THREE.Vector3(R * Math.cos(t), R * Math.sin(t), 0.035));
+    }
+    const outline = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(outlinePoints),
+      new THREE.LineBasicMaterial({ color: 0x111111 })
+    );
+    scene.add(outline);
+
+    // --------------------------------------------------------------------
+    // Spherical square
+    // --------------------------------------------------------------------
+    // Start with a Euclidean square in the plane z = h, then project its
+    // corners radially onto the sphere. Adjacent projected corners determine
+    // four planes through the origin, and each such plane cuts the sphere in
+    // a great circle. Those four great circles are the red curves.
+    //
+    // Made smaller so the square occupies less of the sphere, as requested.
+    const squareSpread = 0.34;  // smaller = narrower square
+    const squareHeight = 1.25;  // larger = pushes it toward the front pole
+
+    const vertices = [
+      new THREE.Vector3(-squareSpread,  squareSpread, squareHeight),
+      new THREE.Vector3( squareSpread,  squareSpread, squareHeight),
+      new THREE.Vector3( squareSpread, -squareSpread, squareHeight),
+      new THREE.Vector3(-squareSpread, -squareSpread, squareHeight)
+    ].map(v => v.normalize().multiplyScalar(R));
+
+    function makeTubeFromPoints(points, radius, color) {
+      const curve = new THREE.CatmullRomCurve3(points, false, 'centripetal');
+      const geometry = new THREE.TubeGeometry(curve, Math.max(32, points.length * 2), radius, 12, false);
+      const material = new THREE.MeshPhongMaterial({
+        color,
+        shininess: 60,
+        specular: 0x777777
+      });
+      return new THREE.Mesh(geometry, material);
+    }
+
+    function greatCircleBasis(a, b) {
+      const normal = new THREE.Vector3().crossVectors(a, b).normalize();
+      const u = a.clone().normalize();
+      const v = new THREE.Vector3().crossVectors(normal, u).normalize();
+      return { normal, u, v };
+    }
+
+    function greatCirclePoints(a, b, segments = 240, lift = 1.006) {
+      const { u, v } = greatCircleBasis(a, b);
+      const pts = [];
+      const radius = R * lift;
+      for (let i = 0; i <= segments; i++) {
+        const t = 2 * Math.PI * i / segments;
+        pts.push(
+          new THREE.Vector3()
+            .addScaledVector(u, radius * Math.cos(t))
+            .addScaledVector(v, radius * Math.sin(t))
+        );
+      }
+      return pts;
+    }
+
+    function minorArcPoints(a, b, segments = 56, lift = 1.012) {
+      // Spherical linear interpolation along the shorter great-circle arc.
+      // (THREE.Vector3 does not have a .slerp() method.)
+      const pts = [];
+      const ua = a.clone().normalize();
+      const ub = b.clone().normalize();
+      const angle = ua.angleTo(ub);
+      const sinAngle = Math.sin(angle);
+
+      for (let i = 0; i <= segments; i++) {
+        const t = i / segments;
+        let p;
+
+        if (Math.abs(sinAngle) < 1e-8) {
+          p = ua.clone().lerp(ub, t).normalize();
+        } else {
+          const w1 = Math.sin((1 - t) * angle) / sinAngle;
+          const w2 = Math.sin(t * angle) / sinAngle;
+          p = ua.clone().multiplyScalar(w1).add(ub.clone().multiplyScalar(w2)).normalize();
+        }
+
+        pts.push(p.multiplyScalar(R * lift));
+      }
+      return pts;
+    }
+
+    const greatCircleRadius = 0.015; // slightly thicker red curves
+    const squareRadius = 0.022;      // blue square emphasized a bit more
+
+    for (let i = 0; i < 4; i++) {
+      globe.add(makeTubeFromPoints(
+        greatCirclePoints(vertices[i], vertices[(i + 1) % 4]),
+        greatCircleRadius,
+        0xe31b23
+      ));
+    }
+
+    // Highlight the actual spherical square edges in blue.
+    for (let i = 0; i < 4; i++) {
+      globe.add(makeTubeFromPoints(
+        minorArcPoints(vertices[i], vertices[(i + 1) % 4]),
+        squareRadius,
+        0x1f6fff
+      ));
+    }
+
+    // Add a subtle blue fill so the square reads clearly at first glance.
+    const fillGeometry = new THREE.BufferGeometry();
+    const fillPositions = new Float32Array([
+      vertices[0].x * 1.001, vertices[0].y * 1.001, vertices[0].z * 1.001,
+      vertices[1].x * 1.001, vertices[1].y * 1.001, vertices[1].z * 1.001,
+      vertices[2].x * 1.001, vertices[2].y * 1.001, vertices[2].z * 1.001,
+      vertices[3].x * 1.001, vertices[3].y * 1.001, vertices[3].z * 1.001,
+    ]);
+    fillGeometry.setAttribute('position', new THREE.BufferAttribute(fillPositions, 3));
+    fillGeometry.setIndex([0, 1, 2, 0, 2, 3]);
+    fillGeometry.computeVertexNormals();
+
+    const fillMesh = new THREE.Mesh(
+      fillGeometry,
+      new THREE.MeshPhongMaterial({
+        color: 0x77aefc,
+        transparent: true,
+        opacity: 0.28,
+        side: THREE.DoubleSide,
+        depthWrite: false
+      })
+    );
+    globe.add(fillMesh);
+
+    // Make the square face the viewer by default.
+    const initialRotation = new THREE.Euler(0, 0, 0, 'XYZ');
+    globe.rotation.copy(initialRotation);
+
+    // Lighting gives the white sphere enough shading to read as 3D.
+    scene.add(new THREE.HemisphereLight(0xffffff, 0xcfcfcf, 2.25));
+    const key = new THREE.DirectionalLight(0xffffff, 2.0);
+    key.position.set(3.5, 4.5, 5.5);
+    scene.add(key);
+
+    // --------------------------------------------------------------------
+    // Interaction: pointer drag + pinch + mouse wheel
+    // --------------------------------------------------------------------
+    const canvas = renderer.domElement;
+    const pointers = new Map();
+    let lastSingle = null;
+    let lastPinchDistance = null;
+
+    const clampZoom = () => {
+      camera.position.z = THREE.MathUtils.clamp(camera.position.z, 2.7, 7.0);
+    };
+
+    canvas.addEventListener('pointerdown', (e) => {
+      canvas.setPointerCapture(e.pointerId);
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      canvas.classList.add('dragging');
+
+      if (pointers.size === 1) {
+        lastSingle = { x: e.clientX, y: e.clientY };
+        lastPinchDistance = null;
+      } else if (pointers.size === 2) {
+        const [p1, p2] = [...pointers.values()];
+        lastPinchDistance = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+        lastSingle = null;
+      }
+    });
+
+    canvas.addEventListener('pointermove', (e) => {
+      if (!pointers.has(e.pointerId)) return;
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+      if (pointers.size === 1 && lastSingle) {
+        const dx = e.clientX - lastSingle.x;
+        const dy = e.clientY - lastSingle.y;
+        globe.rotation.y += dx * 0.008;
+        globe.rotation.x += dy * 0.008;
+        lastSingle = { x: e.clientX, y: e.clientY };
+      } else if (pointers.size === 2) {
+        const [p1, p2] = [...pointers.values()];
+        const d = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+        if (lastPinchDistance !== null && d > 0) {
+          camera.position.z *= lastPinchDistance / d;
+          clampZoom();
+        }
+        lastPinchDistance = d;
+      }
+    });
+
+    function releasePointer(e) {
+      pointers.delete(e.pointerId);
+      if (pointers.size === 0) {
+        lastSingle = null;
+        lastPinchDistance = null;
+        canvas.classList.remove('dragging');
+      } else if (pointers.size === 1) {
+        const p = [...pointers.values()][0];
+        lastSingle = { x: p.x, y: p.y };
+        lastPinchDistance = null;
+      }
+    }
+    canvas.addEventListener('pointerup', releasePointer);
+    canvas.addEventListener('pointercancel', releasePointer);
+
+    canvas.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      camera.position.z *= Math.exp(e.deltaY * 0.0012);
+      clampZoom();
+    }, { passive: false });
+
+    resetButton.addEventListener('click', () => {
+      globe.rotation.copy(initialRotation);
+      camera.position.set(0, 0, 4.25);
+    });
+
+    // Responsive embed sizing.
+    function resize() {
+      const w = Math.max(1, app.clientWidth);
+      const h = Math.max(1, app.clientHeight);
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+    new ResizeObserver(resize).observe(app);
+    resize();
+
+    function animate() {
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+    animate();
+  </script>
+</body>
+</html>
